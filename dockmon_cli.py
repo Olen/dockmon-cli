@@ -92,60 +92,67 @@ def color_version(version: str) -> str:
         return f"{C.YELLOW}{version}{C.RESET}"
     return f"{C.BLUE}{version}{C.RESET}"
 
-def cli_format_containers(containers):
-    """Pretty-print containers in a table with color and emojis."""
-    if not containers:
+def cli_format_hosts(hosts):
+    """Pretty-print all hosts and their containers in aligned tables."""
+    all_containers = []
+    for host in hosts.values():
+        all_containers.extend(host.containers)
+
+    if not all_containers:
         print(f"{C.YELLOW}⚠️  No containers found.{C.RESET}")
         print()
         return
 
-    # Determine column widths
+    # Determine column widths across all hosts
     width = shutil.get_terminal_size((100, 20)).columns
-    name_w = max(max(len(c.name) for c in containers), 9) + 2
-    image_w = max(len(c.image) for c in containers) + 2
-    version_w = max(max(len(c.version) for c in containers), 9) + 11
+    name_w = max(max(len(c.name) for c in all_containers), 9) + 2
+    image_w = max(len(c.image) for c in all_containers) + 2
+    version_w = max(max(len(c.version) for c in all_containers), 9) + 11
     status_w = 25
+    sep_w = min(width, name_w + image_w + status_w + version_w + 20)
 
     header = (
         f"{C.BOLD}{C.CYAN}{'CONTAINER':<{name_w}}{'IMAGE':<{image_w}}"
         f"{'STATUS':<{status_w - 8}}{'VERSION':<{version_w - 9}}UPDATE AVAILABLE{C.RESET}"
     )
-    print(header)
-    print(f"{C.GRAY}{'-' * min(width, name_w + image_w + status_w + version_w + 20)}{C.RESET}")
 
     tot = 0
     uas = 0
     run = 0
     sto = 0
+    first = True
 
-    for c in containers:
-        name = c.name
-        image = c.image
-        status = c.state
-        ports = c.ports
-        version = c.version
-        update = c.update_status
-        tot += 1
-        if update['update_available']:
-            uas += 1
-        if status == 'running':
-            run += 1
-        if status == 'exited':
-            sto += 1
-        print(
-            f"{C.BOLD}{name:<{name_w}}{C.RESET}"
-            f"{C.DIM}{image:<{image_w}}{C.RESET}"
-            f"{color_state(status):<{status_w}}"
-            f"{color_version(version):<{version_w}}"
-            f"{color_update(update)}"
-        )
+    for host in hosts.values():
+        if not host.containers:
+            continue
+
+        if first:
+            print(header)
+            first = False
+
+        print(f"{C.GRAY}{'-' * sep_w}{C.RESET}")
+        print(f"{C.BOLD}Docker host: {C.RED}{host.name}{C.RESET}")
+        print(f"{C.GRAY}{'-' * sep_w}{C.RESET}")
+
+        for c in host.containers:
+            tot += 1
+            if c.update_status['update_available']:
+                uas += 1
+            if c.state == 'running':
+                run += 1
+            if c.state == 'exited':
+                sto += 1
+            print(
+                f"{C.BOLD}{c.name:<{name_w}}{C.RESET}"
+                f"{C.DIM}{c.image:<{image_w}}{C.RESET}"
+                f"{color_state(c.state):<{status_w}}"
+                f"{color_version(c.version):<{version_w}}"
+                f"{color_update(c.update_status)}"
+            )
+
     print()
-    run_color = C.GREEN
-    if run == 0:
-        run_color = C.RED
-    sto_color = C.RED
-    if sto == 0:
-        sto_color = C.GRAY
+    run_color = C.GREEN if run > 0 else C.RED
+    sto_color = C.RED if sto > 0 else C.GRAY
 
     print(
         f"{C.BOLD}{tot}{C.RESET} containers configured "
@@ -154,10 +161,6 @@ def cli_format_containers(containers):
         f"{C.YELLOW}{uas}{C.RESET} containers with update available"
     )
     print()
-
-def cli_format_host(host):
-    """Pretty-print containers in a table with color and emojis."""
-    print(f"{C.BOLD}Docker host: {C.RED}{host.name}{C.RESET}\n")
 
 def json_format(hosts):
     out = [host.as_dict() for host in hosts.values() if len(host.containers) > 0]
@@ -283,33 +286,28 @@ class Container:
 
 
     def _get_version(self, container: dict) -> str:
-        version = container.get('labels').get('org.opencontainers.image.version')
-        image_name = container.get('image').split(":", 1)[0].split("/")[-1]
-        image_version = container.get('image').split(":", 1)[1]
+        labels = container.get('labels') or {}
+        version = labels.get('org.opencontainers.image.version')
+        image_name = container.get('image', '').split(":", 1)[0].split("/")[-1]
+        env = container.get('env') or {}
 
         if not version:
             version_env_strings = ['PG_VERSION', 'REDIS_VERSION', 'INFLUXDB_VERSION']
-            for env in container['env']:
-                if env in version_env_strings:
-                    version = container['env'][env]
+            for key in version_env_strings:
+                if key in env:
+                    version = env[key]
+                    break
 
         if not version:
-            if image_name == 'php':
-                for env in container['env']:
-                    if env == 'PHP_VERSION':
-                        version = container['env'][env]
+            image_env_map = {
+                'php': 'PHP_VERSION',
+                'nginx': 'NGINX_VERSION',
+                'python': 'PYTHON_VERSION',
+            }
+            env_key = image_env_map.get(image_name)
+            if env_key and env_key in env:
+                version = env[env_key]
 
-        if not version:
-            if image_name == 'nginx':
-                for env in container['env']:
-                    if env == 'NGINX_VERSION':
-                        version = container['env'][env]
-
-        if not version:
-            if image_name == 'python':
-                for env in container['env']:
-                    if env == 'PYTHON_VERSION':
-                        version = container['env'][env]
         return version
 
     def parse_ns_iso8601(self, s: str) -> datetime:
@@ -319,7 +317,8 @@ class Container:
                 ts, frac = s.split(".")
                 frac = frac[:6]
                 s = f"{ts}.{frac}"
-            return datetime.fromisoformat(s)
+            dt = datetime.fromisoformat(s)
+            return dt.replace(tzinfo=None)
         except (ValueError, AttributeError):
             return datetime.now()
 
@@ -581,9 +580,7 @@ def main():
         if args.json:
             json_format(hosts)
         else:
-            for host in hosts:
-                cli_format_host(hosts[host])
-                cli_format_containers(hosts[host].containers)
+            cli_format_hosts(hosts)
 
 
 if __name__ == "__main__":
